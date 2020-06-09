@@ -241,6 +241,97 @@ func (b *Builder) BuildAndValidate() (RuntimeConfig, error) {
 	return rt, nil
 }
 
+func (b *Builder) ParseSingleConfig(s Source) (Config, error) {
+	if s.Name == "" || s.Data == "" {
+		return Config{}, nil
+	}
+	config, md, err := Parse(s.Data, s.Format)
+	if err != nil {
+		return Config{}, fmt.Errorf("Error parsing %s: %s", s.Name, err)
+	}
+
+	var unusedErr error
+	for _, k := range md.Unused {
+		switch k {
+		case "acl_enforce_version_8":
+			b.warn("config key %q is deprecated and should be removed", k)
+		default:
+			unusedErr = multierror.Append(unusedErr, fmt.Errorf("invalid config key %s", k))
+		}
+	}
+	if unusedErr != nil {
+		return Config{}, fmt.Errorf("Error parsing %s: %s", s.Name, unusedErr)
+	}
+
+	// for now this is a soft failure that will cause warnings but not actual problems
+	b.validateEnterpriseConfigKeys(&config, md.Keys)
+
+	// if we have a single 'check' or 'service' we need to add them to the
+	// list of checks and services first since we cannot merge them
+	// generically and later values would clobber earlier ones.
+	if config.Check != nil {
+		config.Checks = append(config.Checks, *config.Check)
+		config.Check = nil
+	}
+	if config.Service != nil {
+		config.Services = append(config.Services, *config.Service)
+		config.Service = nil
+	}
+
+	return config, nil
+}
+
+func (b *Builder) ParseAndMergeConfigs(srcs []Source) (Config, error) {
+	var config Config
+
+	for _, src := range srcs {
+		conf, err := b.ParseSingleConfig(src)
+		if err != nil {
+			return config, err
+		}
+
+		config = Merge(config, conf)
+	}
+
+	return config, nil
+}
+
+func (b *Builder) ParseAllConfigs(configFormat string) (config Config, err error) {
+	var userSources []Source
+	for _, src := range b.Sources {
+		// skip file if it should not be parsed
+		if !b.shouldParseFile(src.Name) {
+			continue
+		}
+
+		// if config-format is set, files of any extension will be interpreted in that format
+		src.Format = FormatFrom(src.Name)
+		if configFormat != "" {
+			src.Format = configFormat
+		}
+		userSources = append(userSources, src)
+	}
+
+	user, err := b.ParseAndMergeConfigs(userSources)
+	if err != nil {
+		return Config{}, err
+	}
+
+	// insert
+
+	head, err := b.ParseAndMergeConfigs(b.Head)
+	if err != nil {
+		return Config{}, err
+	}
+
+	tail, err := b.ParseAndMergeConfigs(b.Tail)
+	if err != nil {
+		return Config{}, err
+	}
+
+	return Merge(head, user, tail), nil
+}
+
 // Build constructs the runtime configuration from the config sources
 // and the command line flags. The config sources are processed in the
 // order they were added with the flags being processed last to give
@@ -259,64 +350,9 @@ func (b *Builder) Build() (rt RuntimeConfig, err error) {
 		return RuntimeConfig{}, fmt.Errorf("config: -config-format must be either 'hcl' or 'json'")
 	}
 
-	// build the list of config sources
-	var srcs []Source
-	srcs = append(srcs, b.Head...)
-	for _, src := range b.Sources {
-		// skip file if it should not be parsed
-		if !b.shouldParseFile(src.Name) {
-			continue
-		}
-
-		// if config-format is set, files of any extension will be interpreted in that format
-		src.Format = FormatFrom(src.Name)
-		if configFormat != "" {
-			src.Format = configFormat
-		}
-		srcs = append(srcs, src)
-	}
-	srcs = append(srcs, b.Tail...)
-
-	// parse the config sources into a configuration
-	var c Config
-	for _, s := range srcs {
-		if s.Name == "" || s.Data == "" {
-			continue
-		}
-		c2, md, err := Parse(s.Data, s.Format)
-		if err != nil {
-			return RuntimeConfig{}, fmt.Errorf("Error parsing %s: %s", s.Name, err)
-		}
-
-		var unusedErr error
-		for _, k := range md.Unused {
-			switch k {
-			case "acl_enforce_version_8":
-				b.warn("config key %q is deprecated and should be removed", k)
-			default:
-				unusedErr = multierror.Append(unusedErr, fmt.Errorf("invalid config key %s", k))
-			}
-		}
-		if unusedErr != nil {
-			return RuntimeConfig{}, fmt.Errorf("Error parsing %s: %s", s.Name, unusedErr)
-		}
-
-		// for now this is a soft failure that will cause warnings but not actual problems
-		b.validateEnterpriseConfigKeys(&c2, md.Keys)
-
-		// if we have a single 'check' or 'service' we need to add them to the
-		// list of checks and services first since we cannot merge them
-		// generically and later values would clobber earlier ones.
-		if c2.Check != nil {
-			c2.Checks = append(c2.Checks, *c2.Check)
-			c2.Check = nil
-		}
-		if c2.Service != nil {
-			c2.Services = append(c2.Services, *c2.Service)
-			c2.Service = nil
-		}
-
-		c = Merge(c, c2)
+	c, err := b.ParseAllConfigs(configFormat)
+	if err != nil {
+		return RuntimeConfig{}, err
 	}
 
 	// ----------------------------------------------------------------
